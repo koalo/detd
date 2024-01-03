@@ -51,6 +51,8 @@ Input validation for system configuration is performed in two steps:
 
 import re
 import subprocess
+import math
+import sysrepo
 
 from .ip import CommandIp
 from .ethtool import CommandEthtool
@@ -219,12 +221,59 @@ class QdiscConfigurator:
 
 
     def setup(self, interface, mapping, scheduler, base_time):
-        tc = CommandTc()
+        traffic_class_table = {"number-of-traffic-classes": max(mapping.soprio_to_tc)}
 
-        if interface.device.supports_qbv():
-            tc.set_taprio_offload(interface, mapping, scheduler, base_time)
-        else:
-            raise NotImplementedError("tc.set_taprio_software() not implemented")
+        for i in range(0, min(len(mapping.soprio_to_tc),8)): # only up to 8 traffic classes supported by IEEE 802.1Q
+            traffic_class_table["priority"+str(i)] = mapping.soprio_to_tc[i]
+
+        gate_control_entries = []
+        cycle_time = 0
+        for i in range(0, len(scheduler.schedule)):
+            gatemask = 0
+            for j in reversed(range(0,8)):
+                gatemask <<= 1
+                if j == scheduler.schedule[i].traffic.tc:
+                    gatemask |= 1
+
+            gate_control_entries.append({
+                                  "index": i,
+                                  "operation-name": "ieee802-dot1q-sched:set-gate-states",
+                                  "time-interval-value": scheduler.schedule[i].length,
+                                  "gate-states-value": gatemask
+                                })
+            cycle_time += scheduler.schedule[i].length
+
+        config = {"ietf-interfaces:interfaces":{"interface":[
+            {
+                "name": interface.name,
+                "type": "iana-if-type:ethernetCsmacd",
+                "ieee802-dot1q-bridge:bridge-port": {
+                    "traffic-class": { "traffic-class-table": traffic_class_table },
+                    "ieee802-dot1q-sched-bridge:gate-parameter-table": {
+                        "gate-enabled": True,
+                        "config-change": True,
+                        "supported-list-max": len(gate_control_entries),
+                        "supported-interval-max": max([s['time-interval-value'] for s in gate_control_entries]),
+                        "supported-cycle-max": {
+                          "numerator": 1,
+                          "denominator": 1
+                        },
+                        "admin-cycle-time": {
+                          "numerator": cycle_time,
+                          "denominator": 1000000000
+                        },
+                        "admin-base-time": {
+                            "seconds": str(math.floor(base_time / 1000000000)),
+                            "nanoseconds": base_time % 1000000000
+                        },
+                        "admin-control-list": { "gate-control-entry": gate_control_entries }
+                    }
+                }
+            }]}}
+
+        with sysrepo.SysrepoConnection() as conn:
+            with conn.start_session() as sess:
+                sess.replace_config(config, "ietf-interfaces")
 
 
     def unset(self, interface):
